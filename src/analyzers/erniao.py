@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+二鸟说 · 基金手抄报 分析器（可插拔插件的第一个实现）。
+
+输入：feeds/二鸟说.xml（由 src/gen_rss.py 用 mp 登录态抓取得到，含真实
+      mp.weixin.qq.com/s?__biz=... 微信原文链接）。
+处理：取最新一期「手抄报」→ 用 MP_COOKIE 拉取全文 → 火山方舟(Ark) 结构化抽取。
+输出：data/er-niao/index.json（链接归档 + 轻量结构化信号，约 1KB/期，长期不膨胀）。
+
+为什么放这里而不是 fundmate：
+  二鸟说只是「某个公众号」的增值分析，WeChatRSS 已具备抓取微信原文的能力，
+  且天生自带 mp 原文链接——这正是 fundmate 后端网络拿不到的东西。把分析作为
+  WeChatRSS 的插件，fundmate 保持纯记账、不混入内容管道。
+"""
+from __future__ import annotations
+
+import re
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+import requests
+
+from .base import (
+    Analyzer, UA, call_ark, now_iso,
+)
+
+SENTIMENT_ENUM = "极热 / 过热 / 较热 / 正常 / 正常偏冷 / 较冷 / 极冷"
+PORTFOLIO_ENUM = "价值五剑、成长五剑、平衡五剑、天颐五剑、稳益五剑"
+ACTION_ENUM = "无操作 / 持有 / 加仓 / 减仓 / 定投 / 转换 / 新建仓 / 清仓 / 其他"
+
+SYSTEM_PROMPT = f"""你是一个专业的基金公众号「二鸟说·基金手抄报」文章结构化解析器。
+输入是一篇手抄报全文，请抽取以下字段，只输出一个 JSON 对象，不要任何额外解释。
+
+字段定义：
+  - issue_no: 期号（整数，从标题"手抄报|第N期"或"手抄报|N期"提取，仅数字）
+  - title: 文章完整标题
+  - publish_date: 发布日期（YYYY-MM-DD；若文中写"发布于 07-17"则年份取 2026）
+  - coefficient: 本周温度计系数（0-12 的整数；若文中是"温度为 X 度"则取 X）
+  - sentiment: 情绪标签，必须从以下选择：{SENTIMENT_ENUM}
+  - portfolios: 本期提及的基金组合名称数组，只能从以下选择：{PORTFOLIO_ENUM}；没有则 []
+  - market_view: 市场观点（1-3 句原文要点概括，不要改写太多）
+  - empirical_actions: 【独立结构化数组】逐条解析文中的"实证"或各组合当周操作。
+        每条是一个对象：
+          {{ "name": 条目名（如 "实证2" 或组合名 "成长五剑"）,
+             "action": 操作，从以下选择：{ACTION_ENUM},
+             "note": 该条操作的原文摘录或简短说明（保留关键信息） }}
+        注意：有几条操作就输出几个对象，不要把多条合并成一段字符串；
+              若文中明确"无操作"也请如实输出 action="无操作"。
+  - content: 不需要，不要输出此字段
+
+输出示例：
+{{
+  "issue_no": 186,
+  "title": "手抄报|186期：高切低后，双创半月回调15%",
+  "publish_date": "2026-07-17",
+  "coefficient": 6,
+  "sentiment": "正常偏热",
+  "portfolios": ["价值五剑", "成长五剑"],
+  "market_view": "市场高切低，双创半月回调15%，成交缩量。",
+  "empirical_actions": [
+    {{ "name": "实证2", "action": "无操作", "note": "面对K型分化，建议高切低…" }}
+  ]
+}}
+
+只输出 JSON。
+"""
+
+
+def fetch_mp_article_text(link: str, cookie: str) -> str:
+    """用 mp 登录态 Cookie 拉取微信文章全文（#js_content 区），转纯文本。"""
+    headers = {
+        "User-Agent": UA,
+        "Cookie": cookie,
+        "Referer": "https://mp.weixin.qq.com/",
+    }
+    r = requests.get(link, headers=headers, timeout=30)
+    r.raise_for_status()
+    html = r.text
+    start = html.find('id="js_content"')
+    if start == -1:
+        raise RuntimeError("未找到 js_content（文章正文），可能登录态失效")
+    chunk = html[start:start + 300000]
+    chunk = re.sub(r"<script[\s\S]*?</script>", "", chunk)
+    chunk = re.sub(r"<style[\s\S]*?</style>", "", chunk)
+    text = re.sub(r"<[^>]+>", "\n", chunk)
+    import html as _html
+    text = _html.unescape(text)
+    text = "\n".join(l.strip() for l in text.splitlines() if l.strip())
+    return text
+
+
+def parse_feed_latest(feed_path: Path) -> dict | None:
+    """从 RSS 里取最新一期「手抄报」的标题/链接/日期。"""
+    if not feed_path.exists():
+        return None
+    tree = ET.parse(feed_path)
+    root = tree.getroot()
+    items = root.findall(".//item")
+    for it in items:
+        title = (it.findtext("title") or "").strip()
+        if "手抄报" not in title:
+            continue
+        link = (it.findtext("link") or "").strip()
+        pub = (it.findtext("pubDate") or "").strip()
+        return {"title": title, "link": link, "pub_date": pub}
+    return None
+
+
+class ErNiaoAnalyzer(Analyzer):
+    key = "erniao"
+    feed_name = "二鸟说"
+    source_name = "二鸟说手抄报"
+
+    def _build_rec(self, meta: dict, data: dict, source_url: str) -> dict:
+        return {
+            "issue_no": data.get("issue_no"),
+            "title": data.get("title") or meta.get("title", ""),
+            "publish_date": data.get("publish_date", ""),
+            "source_url": source_url or data.get("source_url", ""),  # 微信原文链接
+            "coefficient": data.get("coefficient"),
+            "sentiment": data.get("sentiment", ""),
+            "portfolios": data.get("portfolios", data.get("portfolio", [])),
+            "market_view": data.get("market_view", ""),
+            "empirical_actions": data.get("empirical_actions", []),
+            "collected_at": now_iso(),
+        }
+
+    def analyze_text(self, text: str, env: dict, source_url: str = "") -> dict:
+        """给定全文文本 → Ark 结构化 dict（CLI --article 用）。"""
+        data = call_ark(text, SYSTEM_PROMPT, env)
+        data["source_url"] = source_url
+        return data
+
+    def run(self, repo_root: Path, env: dict) -> dict:
+        feed_path = repo_root / "feeds" / f"{self.feed_name}.xml"
+        meta = parse_feed_latest(feed_path)
+        if not meta or not meta.get("link"):
+            print(f"  · [{self.key}] 订阅源无手抄报条目（可能未配 __biz 或抓取失败），跳过")
+            return {"added": 0, "updated": 0, "skipped": 1}
+
+        cookie = env.get("MP_COOKIE") or ""
+        try:
+            if cookie:
+                text = fetch_mp_article_text(meta["link"], cookie)
+            else:
+                print(f"  · [{self.key}] 无 MP_COOKIE，无法取全文，跳过")
+                return {"added": 0, "updated": 0, "skipped": 1}
+            data = call_ark(text, SYSTEM_PROMPT, env)
+        except Exception as e:
+            print(f"  ✗ [{self.key}] 分析失败: {e}", file=sys.stderr)
+            return {"added": 0, "updated": 0, "skipped": 1}
+
+        rec = self._build_rec(meta, data, meta["link"])
+        is_new = self.save_rec(repo_root, rec)
+        print(f"  ✓ [{self.key}] {'新增' if is_new else '更新'} "
+              f"{rec['issue_no']} 期 → {repo_root / 'data' / self.key / 'index.json'}")
+        return {"added": int(is_new), "updated": int(not is_new), "skipped": 0}

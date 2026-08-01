@@ -1,0 +1,77 @@
+name: wechat-rss
+on:
+  schedule:
+    # 北京时间 07:00 与 19:00（UTC 23:00 / 11:00）
+    - cron: "0 23,11 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 同步书单账号到 accounts.txt
+        run: python src/sync_booklist.py
+
+      - name: 抓取并生成 RSS
+        env:
+          MP_COOKIE: ${{ secrets.MP_COOKIE }}           # mp.weixin.qq.com 登录 Cookie（含 data_ticket）
+          MP_TOKEN: ${{ secrets.MP_TOKEN }}             # mp 后台 URL 里的 token（数字串，可选）
+          WX_ACCOUNTS: "且慢,MzAxxxx|有知有行,MzBxxxx"  # 管道分隔，会与 accounts.txt 合并
+          ACCOUNTS_FILE: "accounts.txt"
+        run: python src/gen_rss.py
+
+      - name: 运行可插拔分析器（结构化派生数据）
+        env:
+          MP_COOKIE: ${{ secrets.MP_COOKIE }}
+          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}       # 火山方舟 Key（分析器用；未配置则分析器跳过）
+          ARK_MODEL: ${{ secrets.ARK_MODEL }}
+        run: python src/analyze.py
+
+      - name: 提交并更新 Pages
+        run: |
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git add feeds accounts.txt data
+          if git diff --cached --quiet; then
+            echo "无更新，跳过提交"
+          else
+            git commit -m "chore: update wechat rss $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
+
+      - name: 检测抓取是否失败
+        id: check
+        run: test -f feeds/.fetch_failed && echo "failed=true" >> "$GITHUB_OUTPUT" || echo "failed=false" >> "$GITHUB_OUTPUT"
+
+      - name: 开 Issue 提醒检查登录态
+        if: steps.check.outputs.failed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: "⚠️ WeChatRSS 抓取失败，请检查 mp 登录态是否有效",
+              body: "抓取连续失败，可能是 MP_COOKIE 过期（data_ticket 失效）或 MP_TOKEN 不对。请重新登录 mp.weixin.qq.com 并更新 Secrets 中的 MP_COOKIE / MP_TOKEN。"
+            })
+
+      - name: 部署到 GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./feeds
+          publish_branch: gh-pages
