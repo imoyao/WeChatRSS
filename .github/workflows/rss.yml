@@ -38,6 +38,7 @@ jobs:
       - name: 运行可插拔分析器（结构化派生数据）
         env:
           MP_COOKIE: ${{ secrets.MP_COOKIE }}
+          XUEQIU_COOKIE: ${{ secrets.XUEQIU_COOKIE }}   # 雪球登录态 Cookie（分析器走 JSON API 取手抄报，最稳；未配置则降级 headless/微信）
           ARK_API_KEY: ${{ secrets.ARK_API_KEY }}       # 火山方舟 Key（分析器用；未配置则分析器跳过）
           ARK_MODEL: ${{ secrets.ARK_MODEL }}
         run: |

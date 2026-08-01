@@ -5,9 +5,9 @@
 
 输入：feeds/二鸟说.xml（由 src/gen_rss.py 用 mp 登录态抓取得到，含真实
       mp.weixin.qq.com/s?__biz=... 微信原文链接）。
-处理：优先用「雪球镜像」通道（Playwright 无头渲染过 WAF，零凭证）取最新一期手抄报
-      全文；若雪球被 WAF 拦截，则降级用 MP_COOKIE 从微信原文拉取；两者皆不可用
-      时跳过。最终统一交给火山方舟(Ark) 结构化抽取。
+处理：优先用「雪球 Cookie + JSON API」通道（绕开 WAF/headless 检测，最稳）取最新一期
+      手抄报全文；无雪球 Cookie 时降级用 Playwright 无头渲染（尽力，CI 常被 WAF 拦）；
+      再不行降级 MP_COOKIE 从微信原文拉取；皆不可用则跳过。最终交给火山方舟(Ark) 结构化抽取。
 输出：data/er-niao/index.json（链接归档 + 轻量结构化信号，约 1KB/期，长期不膨胀）。
 
 为什么放这里而不是 fundmate：
@@ -120,6 +120,59 @@ def parse_feed_latest(feed_path: Path) -> dict | None:
     return None
 
 
+def _strip_html(s: str) -> str:
+    """去掉 HTML 标签并反转义，得到纯文本。"""
+    if not s:
+        return ""
+    s = re.sub(r"<script[\s\S]*?</script>", " ", s)
+    s = re.sub(r"<style[\s\S]*?</style>", " ", s)
+    s = re.sub(r"<[^>]+>", "\n", s)
+    import html as _html
+    s = _html.unescape(s)
+    return "\n".join(l.strip() for l in s.splitlines() if l.strip())
+
+
+def fetch_xueqiu_latest_via_api(cookie: str) -> dict | None:
+    """用 雪球 Cookie 调 user_timeline JSON API 取最新『手抄报』。
+
+    相比 headless 渲染，API + 登录态 Cookie 能稳定绕过 WAF 与 headless 检测；
+    返回的 text 通常是完整正文（HTML），剥离标签即得全文。无 cookie 返回 None。
+    """
+    if not cookie:
+        return None
+    try:
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA, "Cookie": cookie})
+        # 先访问首页刷新 xq_a_token 等令牌（cookie 通常已含，这里幂等）
+        try:
+            s.get("https://xueqiu.com/", timeout=20)
+        except Exception:
+            pass
+        api = (f"https://xueqiu.com/statuses/user_timeline.json"
+               f"?user_id={XUEQIU_UID}&page=1&count=20&type=0&sort=alpha")
+        r = s.get(api, headers={
+            "Referer": f"https://xueqiu.com/u/{XUEQIU_UID}",
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+        }, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        for st in data.get("list", []):
+            raw = (st.get("title") or "") + "\n" + (st.get("text") or "")
+            if "手抄报" not in raw:
+                continue
+            pid = st.get("id")
+            url = f"https://xueqiu.com/{XUEQIU_UID}/{pid}"
+            text = _strip_html(st.get("text") or "")
+            if text:
+                return {"url": url, "text": text[:20000]}
+        print("  · [erniao] 雪球 API 未找到含『手抄报』的帖子（可能本周未发新期）")
+        return None
+    except Exception as e:
+        print(f"  · [erniao] 雪球 API 取数失败: {e}")
+        return None
+
+
 def fetch_xueqiu_latest_via_playwright() -> dict | None:
     """用无头 Chromium 渲染过雪球 WAF，取最新一期手抄报的 {url, text}。
 
@@ -207,13 +260,22 @@ class ErNiaoAnalyzer(Analyzer):
 
         text = None
         source_url = ""
-        # 1) 雪球默认通道（Playwright 渲染过 WAF，零凭证）
-        xq = fetch_xueqiu_latest_via_playwright()
-        if xq:
-            text = xq["text"]
-            source_url = xq["url"]
-            print(f"  · [{self.key}] 雪球通道取到全文 → {source_url}")
-        # 2) 微信降级通道（需 MP_COOKIE）
+        xq_cookie = env.get("XUEQIU_COOKIE") or ""
+        # 1) 雪球默认通道：有 cookie 走 JSON API（稳，绕开 WAF/headless 检测）；
+        #    无 cookie 走 headless（尽力，CI 常被 WAF 拦）
+        if xq_cookie:
+            xq = fetch_xueqiu_latest_via_api(xq_cookie)
+            if xq:
+                text = xq["text"]
+                source_url = xq["url"]
+                print(f"  · [{self.key}] 雪球 API 取到全文 → {source_url}")
+        if not text:
+            xq = fetch_xueqiu_latest_via_playwright()
+            if xq:
+                text = xq["text"]
+                source_url = xq["url"]
+                print(f"  · [{self.key}] 雪球(headless)取到全文 → {source_url}")
+        # 2) 微信降级通道（需 MP_COOKIE + feed 链接）
         if not text and cookie and meta and meta.get("link"):
             try:
                 text = fetch_mp_article_text(meta["link"], cookie)
