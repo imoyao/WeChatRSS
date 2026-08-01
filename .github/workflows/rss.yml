@@ -40,7 +40,10 @@ jobs:
           MP_COOKIE: ${{ secrets.MP_COOKIE }}
           ARK_API_KEY: ${{ secrets.ARK_API_KEY }}       # 火山方舟 Key（分析器用；未配置则分析器跳过）
           ARK_MODEL: ${{ secrets.ARK_MODEL }}
-        run: python src/analyze.py
+        run: |
+          # 二鸟说雪球通道需无头 Chromium 渲染过 WAF；安装失败则优雅跳过（不阻断其他 feed）
+          playwright install --with-deps chromium || playwright install chromium || true
+          python src/analyze.py
 
       - name: 提交并更新 Pages
         run: |

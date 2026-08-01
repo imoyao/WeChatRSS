@@ -5,7 +5,9 @@
 
 输入：feeds/二鸟说.xml（由 src/gen_rss.py 用 mp 登录态抓取得到，含真实
       mp.weixin.qq.com/s?__biz=... 微信原文链接）。
-处理：取最新一期「手抄报」→ 用 MP_COOKIE 拉取全文 → 火山方舟(Ark) 结构化抽取。
+处理：优先用「雪球镜像」通道（Playwright 无头渲染过 WAF，零凭证）取最新一期手抄报
+      全文；若雪球被 WAF 拦截，则降级用 MP_COOKIE 从微信原文拉取；两者皆不可用
+      时跳过。最终统一交给火山方舟(Ark) 结构化抽取。
 输出：data/er-niao/index.json（链接归档 + 轻量结构化信号，约 1KB/期，长期不膨胀）。
 
 为什么放这里而不是 fundmate：
@@ -22,9 +24,19 @@ from pathlib import Path
 
 import requests
 
+try:
+    from playwright.sync_api import sync_playwright
+    _HAVE_PLAYWRIGHT = True
+except Exception:
+    _HAVE_PLAYWRIGHT = False
+
 from .base import (
     Analyzer, UA, call_ark, now_iso,
 )
+
+# 二鸟说 雪球 UID（雪球镜像通道用它定位最新手抄报）
+XUEQIU_UID = "3502863673"
+XUEQIU_USER_URL = f"https://xueqiu.com/u/{XUEQIU_UID}"
 
 SENTIMENT_ENUM = "极热 / 过热 / 较热 / 正常 / 正常偏冷 / 较冷 / 极冷"
 PORTFOLIO_ENUM = "价值五剑、成长五剑、平衡五剑、天颐五剑、稳益五剑"
@@ -108,6 +120,61 @@ def parse_feed_latest(feed_path: Path) -> dict | None:
     return None
 
 
+def fetch_xueqiu_latest_via_playwright() -> dict | None:
+    """用无头 Chromium 渲染过雪球 WAF，取最新一期手抄报的 {url, text}。
+
+    雪球对普通 requests 返回 WAF 挑战页（非内容），必须用真实浏览器渲染。
+    任何失败/被拦都返回 None，由 run() 优雅降级到微信或跳过，绝不抛异常炸掉 Action。
+    """
+    if not _HAVE_PLAYWRIGHT:
+        print("  · [erniao] 未安装 playwright，跳过雪球通道"
+              "（pip install playwright && playwright install chromium）")
+        return None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            ctx = browser.new_context(user_agent=UA)
+            page = ctx.new_page()
+            page.goto(XUEQIU_USER_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(6000)  # 等 JS 渲染 + WAF 挑战结算
+
+            # 抽取含「手抄报」的文章链接（时间倒序，取第一条=最新）
+            items = page.evaluate(
+                """(uid) => {
+                    const out = [];
+                    document.querySelectorAll('a').forEach(a => {
+                        const href = a.href || '';
+                        const text = (a.innerText || '').trim();
+                        if (href.includes(uid) && text.includes('手抄报')) {
+                            out.push({href, text});
+                        }
+                    });
+                    return out;
+                }""",
+                XUEQIU_UID,
+            )
+            if not items:
+                print("  · [erniao] 雪球页面未渲染出手抄报条目（可能被 WAF 拦截）")
+                browser.close()
+                return None
+
+            url = items[0]["href"]
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(6000)
+            text = page.evaluate("() => document.body.innerText") or ""
+            browser.close()
+
+            text = text[:20000]
+            if "手抄报" not in text:
+                print("  · [erniao] 雪球文章正文未取到手抄报内容，疑似被拦")
+                return None
+            return {"url": url, "text": text}
+    except Exception as e:
+        print(f"  · [erniao] 雪球 Playwright 取数失败: {e}")
+        return None
+
+
 class ErNiaoAnalyzer(Analyzer):
     key = "erniao"
     feed_name = "二鸟说"
@@ -136,23 +203,35 @@ class ErNiaoAnalyzer(Analyzer):
     def run(self, repo_root: Path, env: dict) -> dict:
         feed_path = repo_root / "feeds" / f"{self.feed_name}.xml"
         meta = parse_feed_latest(feed_path)
-        if not meta or not meta.get("link"):
-            print(f"  · [{self.key}] 订阅源无手抄报条目（可能未配 __biz 或抓取失败），跳过")
-            return {"added": 0, "updated": 0, "skipped": 1}
-
         cookie = env.get("MP_COOKIE") or ""
-        try:
-            if cookie:
+
+        text = None
+        source_url = ""
+        # 1) 雪球默认通道（Playwright 渲染过 WAF，零凭证）
+        xq = fetch_xueqiu_latest_via_playwright()
+        if xq:
+            text = xq["text"]
+            source_url = xq["url"]
+            print(f"  · [{self.key}] 雪球通道取到全文 → {source_url}")
+        # 2) 微信降级通道（需 MP_COOKIE）
+        if not text and cookie and meta and meta.get("link"):
+            try:
                 text = fetch_mp_article_text(meta["link"], cookie)
-            else:
-                print(f"  · [{self.key}] 无 MP_COOKIE，无法取全文，跳过")
-                return {"added": 0, "updated": 0, "skipped": 1}
+                source_url = meta["link"]
+                print(f"  · [{self.key}] 微信通道取到全文 → {source_url}")
+            except Exception as e:
+                print(f"  ✗ [{self.key}] 微信取数失败: {e}", file=sys.stderr)
+        if not text:
+            print(f"  · [{self.key}] 雪球与微信均不可用，跳过"
+                  f"（雪球可能被 WAF 拦截；或配置 MP_COOKIE 走微信降级）")
+            return {"added": 0, "updated": 0, "skipped": 1}
+        try:
             data = call_ark(text, SYSTEM_PROMPT, env)
         except Exception as e:
-            print(f"  ✗ [{self.key}] 分析失败: {e}", file=sys.stderr)
+            print(f"  ✗ [{self.key}] Ark 解析失败: {e}", file=sys.stderr)
             return {"added": 0, "updated": 0, "skipped": 1}
 
-        rec = self._build_rec(meta, data, meta["link"])
+        rec = self._build_rec(meta or {}, data, source_url)
         is_new = self.save_rec(repo_root, rec)
         print(f"  ✓ [{self.key}] {'新增' if is_new else '更新'} "
               f"{rec['issue_no']} 期 → {repo_root / 'data' / self.key / 'index.json'}")
