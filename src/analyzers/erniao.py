@@ -132,22 +132,25 @@ def _strip_html(s: str) -> str:
     return "\n".join(l.strip() for l in s.splitlines() if l.strip())
 
 
-def fetch_xueqiu_latest_via_api(cookie: str) -> dict | None:
-    """用 雪球 Cookie 调 user_timeline JSON API 取最新『手抄报』。
+def fetch_xueqiu_latest_via_api(cookie: str = "") -> dict | None:
+    """用 雪球 Cookie（或游客令牌）调 user_timeline JSON API 取最新『手抄报』。
 
-    相比 headless 渲染，API + 登录态 Cookie 能稳定绕过 WAF 与 headless 检测；
-    返回的 text 通常是完整正文（HTML），剥离标签即得全文。无 cookie 返回 None。
+    优先级：① 提供 XUEQIU_COOKIE → 直接用（最稳）；② 未提供 → 先访问首页拿游客
+    xq_a_token，再试 API（零凭证尽力，依赖 CI 出口 IP 未被 WAF 拦）。
+    相比 headless 渲染，API + 登录态/游客令牌能稳定绕过 WAF 与 headless 检测；
+    返回的 text 通常是完整正文（HTML），剥离标签即得全文。全失败返回 None。
     """
-    if not cookie:
-        return None
     try:
         s = requests.Session()
-        s.headers.update({"User-Agent": UA, "Cookie": cookie})
-        # 先访问首页刷新 xq_a_token 等令牌（cookie 通常已含，这里幂等）
-        try:
-            s.get("https://xueqiu.com/", timeout=20)
-        except Exception:
-            pass
+        s.headers.update({"User-Agent": UA})
+        if cookie:
+            s.headers.update({"Cookie": cookie})
+        else:
+            # 零凭证：访问首页拿游客令牌（被 WAF 拦则后续 API 也会失败 → 优雅降级）
+            try:
+                s.get("https://xueqiu.com/", timeout=20)
+            except Exception:
+                pass
         api = (f"https://xueqiu.com/statuses/user_timeline.json"
                f"?user_id={XUEQIU_UID}&page=1&count=20&type=0&sort=alpha")
         r = s.get(api, headers={
