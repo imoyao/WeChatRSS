@@ -5,15 +5,26 @@
 
 输入：feeds/二鸟说.xml（由 src/gen_rss.py 用 mp 登录态抓取得到，含真实
       mp.weixin.qq.com/s?__biz=... 微信原文链接）。
-处理：优先用「雪球 Cookie + JSON API」通道（绕开 WAF/headless 检测，最稳）取最新一期
-      手抄报全文；无雪球 Cookie 时降级用 Playwright 无头渲染（尽力，CI 常被 WAF 拦）；
-      再不行降级 MP_COOKIE 从微信原文拉取；皆不可用则跳过。最终交给火山方舟(Ark) 结构化抽取。
+处理：默认走「雪球游客零凭证通道」——真实浏览器过阿里云 WAF 拿游客令牌，
+      用页内 fetch 驱动 timeline API 取最新一期手抄报全文。零 Secret、全自动，
+      适合 GitHub Actions 长期无人值守运行。
+      若配置了 XUEQIU_COOKIE（登录态），则作为更快更全的兜底（但 Cookie 会过期，
+      需定期重贴，非必须）；再不行降级 MP_COOKIE 从微信原文拉取；皆不可用则跳过。
+      最终交给火山方舟(Ark) 结构化抽取。
 输出：data/er-niao/index.json（链接归档 + 轻量结构化信号，约 1KB/期，长期不膨胀）。
 
 为什么放这里而不是 fundmate：
   二鸟说只是「某个公众号」的增值分析，WeChatRSS 已具备抓取微信原文的能力，
   且天生自带 mp 原文链接——这正是 fundmate 后端网络拿不到的东西。把分析作为
   WeChatRSS 的插件，fundmate 保持纯记账、不混入内容管道。
+
+雪球游客通道踩坑记录（已解决）：
+  - 阿里云 WAF 会检测无头浏览器自动化特征，默认 headless 拿不到 xq_a_token；
+    必须 --disable-blink-features=AutomationControlled + 抹 navigator.webdriver。
+  - xq_a_token 是 HttpOnly，document.cookie 看不到，必须用 ctx.cookies() 读。
+  - 游客态 timeline API 必须用「页内 fetch（credentials:'include'）」调用，
+    普通 requests 即便带上游客令牌也会被 10022 拒；页内 fetch 自动带齐 cookie 会话。
+  - 游客态只开放最新 ~20 帖，足够「每日抓最新一期」，不够回看历史（历史见 archive.json）。
 """
 from __future__ import annotations
 
@@ -37,6 +48,14 @@ from .base import (
 # 二鸟说 雪球 UID（雪球镜像通道用它定位最新手抄报）
 XUEQIU_UID = "3502863673"
 XUEQIU_USER_URL = f"https://xueqiu.com/u/{XUEQIU_UID}"
+
+# 优先用本机已装的 Edge（Chromium 内核），避免下载 150MB 的 playwright chromium；
+# CI(ubuntu) 上无 Edge，则回退到 rss.yml 已安装的 playwright chromium。
+_EDGE_CANDIDATES = [
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+]
+EDGE_PATH = next((p for p in _EDGE_CANDIDATES if Path(p).exists()), None)
 
 SENTIMENT_ENUM = "极热 / 过热 / 较热 / 正常 / 正常偏冷 / 较冷 / 极冷"
 PORTFOLIO_ENUM = "价值五剑、成长五剑、平衡五剑、天颐五剑、稳益五剑"
@@ -132,35 +151,139 @@ def _strip_html(s: str) -> str:
     return "\n".join(l.strip() for l in s.splitlines() if l.strip())
 
 
-def fetch_xueqiu_latest_via_api(cookie: str = "") -> dict | None:
-    """用 雪球 Cookie（或游客令牌）调 user_timeline JSON API 取最新『手抄报』。
+# ---------------------------------------------------------------------------
+# 雪球游客通道：浏览器过 WAF + 页内 fetch（零凭证，默认主通道）
+# ---------------------------------------------------------------------------
+def _open_guest_browser():
+    """真实浏览器过 WAF，返回 (browser, page)，page 已停在用户页且拿到游客令牌。
 
-    优先级：① 提供 XUEQIU_COOKIE → 直接用（最稳）；② 未提供 → 先访问首页拿游客
-    xq_a_token，再试 API（零凭证尽力，依赖 CI 出口 IP 未被 WAF 拦）。
-    相比 headless 渲染，API + 登录态/游客令牌能稳定绕过 WAF 与 headless 检测；
-    返回的 text 通常是完整正文（HTML），剥离标签即得全文。全失败返回 None。
+    关键：阿里云 WAF 会检测无头浏览器自动化特征（navigator.webdriver /
+    AutomationControlled），默认 headless 拿不到 xq_a_token。必须 stealth 参数 +
+    抹掉 webdriver 标记，模拟真人浏览器才能通过挑战拿到游客令牌。
+    xq_a_token 是 HttpOnly，必须用 ctx.cookies() 读取（document.cookie 看不到）。
     """
+    launch_kwargs = dict(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage",
+              "--disable-blink-features=AutomationControlled",
+              "--disable-infobars"],
+    )
+    if EDGE_PATH:
+        launch_kwargs["executable_path"] = EDGE_PATH
+        print(f"  · [erniao] 游客通道使用本机 Edge: {EDGE_PATH}")
+    else:
+        print("  · [erniao] 游客通道使用 playwright 自带 chromium")
+    p = sync_playwright().start()
+    browser = p.chromium.launch(**launch_kwargs)
+    ctx = browser.new_context(user_agent=UA, viewport={"width": 1280, "height": 800})
+    # 抹掉自动化标记，避免被 WAF 识别为 bot
+    ctx.add_init_script(
+        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+    page = ctx.new_page()
+    print("  · [erniao] 打开 xueqiu 首页，等待 WAF 挑战结算…")
+    page.goto("https://xueqiu.com/", wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(15000)
+    cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+    if "xq_a_token" not in cookies:
+        print("  · [erniao] 首页未拿到令牌，再访问用户页…")
+        page.goto(XUEQIU_USER_URL, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(12000)
+        cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+    if "xq_a_token" in cookies:
+        print("  · [erniao] 已拿到 xq_a_token，WAF 通过（游客零凭证）")
+    else:
+        print("  ! [erniao] 未拿到 xq_a_token（本环境 IP 可能被 WAF 拦）")
+    page.goto(XUEQIU_USER_URL, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(8000)
+    return browser, page
+
+
+# 页内 fetch：credentials:'include' 自动带齐 cookie 会话，绕过 10022 拒访
+_TIMELINE_FETCH_JS = """async (url) => {
+    const r = await fetch(url, {credentials:'include',
+        headers:{'X-Requested-With':'XMLHttpRequest','Accept':'application/json'}});
+    const t = await r.text();
+    let j=null; try{j=JSON.parse(t);}catch(e){}
+    if(!j) return {err:r.status, head:t.slice(0,200)};
+    const st = j.statuses || j.list || [];
+    return {statuses: st.map(x=>({
+        id:x.id, title:x.title, text:x.text, created_at:x.created_at
+    }))};
+}"""
+
+
+def fetch_xueqiu_latest_via_guest() -> dict | None:
+    """雪球游客零凭证通道：过 WAF 拿游客令牌，页内 fetch 最新一期手抄报。
+
+    零 Secret、全自动。游客态只能取最新 ~20 帖，足够「每日抓最新一期」。
+    任何失败/被拦都返回 None，由 run() 优雅降级，绝不抛异常炸掉 Action。
+    """
+    if not _HAVE_PLAYWRIGHT:
+        print("  · [erniao] 未安装 playwright，跳过雪球游客通道"
+              "（pip install playwright && playwright install chromium）")
+        return None
+    try:
+        browser, page = _open_guest_browser()
+        try:
+            api = (f"https://xueqiu.com/statuses/user_timeline.json"
+                   f"?user_id={XUEQIU_UID}&count=20&type=0")
+            res = page.evaluate(_TIMELINE_FETCH_JS, api)
+            if res.get("err"):
+                print(f"  · [erniao] 游客 timeline API err {res['err']}: "
+                      f"{res.get('head','')[:120]}")
+                return None
+            statuses = res.get("statuses") or []
+            cands = [s for s in statuses
+                     if "手抄报" in (s.get("title") or "") + (s.get("text") or "")]
+            if not cands:
+                print("  · [erniao] 游客 timeline 未找到手抄报"
+                      "（本周可能未发新期）")
+                return None
+            # 取 id 最大（最新）的一期
+            cands.sort(key=lambda s: int(s.get("id") or 0), reverse=True)
+            s = cands[0]
+            pid = str(s.get("id"))
+            url = f"https://xueqiu.com/{XUEQIU_UID}/{pid}"
+            text = _strip_html(s.get("text") or "")
+            # 游客 timeline 的 text 偶偏短，补抓正文页拿全文
+            if len(text) < 200:
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(6000)
+                t2 = page.evaluate("() => document.body.innerText") or ""
+                if "手抄报" in t2:
+                    text = t2
+            if not text.strip():
+                return None
+            return {"url": url, "text": text[:20000]}
+        finally:
+            browser.close()
+    except Exception as e:
+        print(f"  · [erniao] 雪球游客通道取数失败: {e}")
+        return None
+
+
+def fetch_xueqiu_latest_via_api(cookie: str = "") -> dict | None:
+    """雪球登录态 JSON API 通道（XUEQIU_COOKIE 配置时作为游客通道的兜底）。
+
+    登录态可绕过 WAF/headless 检测，比游客更稳更全，但 Cookie 会过期需定期重贴。
+    无 cookie 时先访问首页拿游客令牌（可能被 WAF 拦 → 优雅降级）。全失败返回 None。
+    """
+    if not cookie:
+        return None
     try:
         s = requests.Session()
         s.headers.update({"User-Agent": UA})
-        if cookie:
-            s.headers.update({"Cookie": cookie})
-        else:
-            # 零凭证：访问首页拿游客令牌（被 WAF 拦则后续 API 也会失败 → 优雅降级）
-            try:
-                s.get("https://xueqiu.com/", timeout=20)
-            except Exception:
-                pass
+        s.headers.update({"Cookie": cookie})
         api = (f"https://xueqiu.com/statuses/user_timeline.json"
                f"?user_id={XUEQIU_UID}&page=1&count=20&type=0&sort=alpha")
         r = s.get(api, headers={
-            "Referer": f"https://xueqiu.com/u/{XUEQIU_UID}",
+            "Referer": XUEQIU_USER_URL,
             "Accept": "application/json, text/plain, */*",
             "X-Requested-With": "XMLHttpRequest",
         }, timeout=30)
         r.raise_for_status()
         data = r.json()
-        for st in data.get("list", []):
+        for st in data.get("statuses") or data.get("list") or []:
             raw = (st.get("title") or "") + "\n" + (st.get("text") or "")
             if "手抄报" not in raw:
                 continue
@@ -169,65 +292,10 @@ def fetch_xueqiu_latest_via_api(cookie: str = "") -> dict | None:
             text = _strip_html(st.get("text") or "")
             if text:
                 return {"url": url, "text": text[:20000]}
-        print("  · [erniao] 雪球 API 未找到含『手抄报』的帖子（可能本周未发新期）")
+        print("  · [erniao] 雪球登录 API 未找到含『手抄报』的帖子")
         return None
     except Exception as e:
-        print(f"  · [erniao] 雪球 API 取数失败: {e}")
-        return None
-
-
-def fetch_xueqiu_latest_via_playwright() -> dict | None:
-    """用无头 Chromium 渲染过雪球 WAF，取最新一期手抄报的 {url, text}。
-
-    雪球对普通 requests 返回 WAF 挑战页（非内容），必须用真实浏览器渲染。
-    任何失败/被拦都返回 None，由 run() 优雅降级到微信或跳过，绝不抛异常炸掉 Action。
-    """
-    if not _HAVE_PLAYWRIGHT:
-        print("  · [erniao] 未安装 playwright，跳过雪球通道"
-              "（pip install playwright && playwright install chromium）")
-        return None
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            ctx = browser.new_context(user_agent=UA)
-            page = ctx.new_page()
-            page.goto(XUEQIU_USER_URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(6000)  # 等 JS 渲染 + WAF 挑战结算
-
-            # 抽取含「手抄报」的文章链接（时间倒序，取第一条=最新）
-            items = page.evaluate(
-                """(uid) => {
-                    const out = [];
-                    document.querySelectorAll('a').forEach(a => {
-                        const href = a.href || '';
-                        const text = (a.innerText || '').trim();
-                        if (href.includes(uid) && text.includes('手抄报')) {
-                            out.push({href, text});
-                        }
-                    });
-                    return out;
-                }""",
-                XUEQIU_UID,
-            )
-            if not items:
-                print("  · [erniao] 雪球页面未渲染出手抄报条目（可能被 WAF 拦截）")
-                browser.close()
-                return None
-
-            url = items[0]["href"]
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(6000)
-            text = page.evaluate("() => document.body.innerText") or ""
-            browser.close()
-
-            text = text[:20000]
-            if "手抄报" not in text:
-                print("  · [erniao] 雪球文章正文未取到手抄报内容，疑似被拦")
-                return None
-            return {"url": url, "text": text}
-    except Exception as e:
-        print(f"  · [erniao] 雪球 Playwright 取数失败: {e}")
+        print(f"  · [erniao] 雪球登录 API 取数失败: {e}")
         return None
 
 
@@ -260,25 +328,27 @@ class ErNiaoAnalyzer(Analyzer):
         feed_path = repo_root / "feeds" / f"{self.feed_name}.xml"
         meta = parse_feed_latest(feed_path)
         cookie = env.get("MP_COOKIE") or ""
+        xq_cookie = env.get("XUEQIU_COOKIE") or ""
 
         text = None
         source_url = ""
-        xq_cookie = env.get("XUEQIU_COOKIE") or ""
-        # 1) 雪球默认通道：有 cookie 走 JSON API（稳，绕开 WAF/headless 检测）；
-        #    无 cookie 走 headless（尽力，CI 常被 WAF 拦）
-        if xq_cookie:
-            xq = fetch_xueqiu_latest_via_api(xq_cookie)
-            if xq:
-                text = xq["text"]
-                source_url = xq["url"]
-                print(f"  · [{self.key}] 雪球 API 取到全文 → {source_url}")
-        if not text:
-            xq = fetch_xueqiu_latest_via_playwright()
-            if xq:
-                text = xq["text"]
-                source_url = xq["url"]
-                print(f"  · [{self.key}] 雪球(headless)取到全文 → {source_url}")
-        # 2) 微信降级通道（需 MP_COOKIE + feed 链接）
+
+        # 1) 游客零凭证通道（默认主通道，不依赖任何 Secret）
+        xq = fetch_xueqiu_latest_via_guest()
+        if xq:
+            text = xq["text"]
+            source_url = xq["url"]
+            print(f"  · [{self.key}] 游客通道取到全文 → {source_url}")
+
+        # 2) 可选：配置了 XUEQIU_COOKIE 则登录 API 兜底（更快更全，但需定期重贴）
+        if not text and xq_cookie:
+            xq2 = fetch_xueqiu_latest_via_api(xq_cookie)
+            if xq2:
+                text = xq2["text"]
+                source_url = xq2["url"]
+                print(f"  · [{self.key}] 雪球登录 API 取到全文 → {source_url}")
+
+        # 3) 微信降级通道（需 MP_COOKIE + feed 链接）
         if not text and cookie and meta and meta.get("link"):
             try:
                 text = fetch_mp_article_text(meta["link"], cookie)
@@ -286,10 +356,12 @@ class ErNiaoAnalyzer(Analyzer):
                 print(f"  · [{self.key}] 微信通道取到全文 → {source_url}")
             except Exception as e:
                 print(f"  ✗ [{self.key}] 微信取数失败: {e}", file=sys.stderr)
+
         if not text:
-            print(f"  · [{self.key}] 雪球与微信均不可用，跳过"
-                  f"（雪球可能被 WAF 拦截；或配置 MP_COOKIE 走微信降级）")
+            print(f"  · [{self.key}] 雪球游客/登录与微信均不可用，跳过"
+                  f"（雪球可能被 WAF 拦截；或配置 XUEQIU_COOKIE / MP_COOKIE 兜底）")
             return {"added": 0, "updated": 0, "skipped": 1}
+
         try:
             data = call_ark(text, SYSTEM_PROMPT, env)
         except Exception as e:
