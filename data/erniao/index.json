@@ -1,0 +1,26 @@
+{
+  "source": "erniao",
+  "source_name": "二鸟说手抄报",
+  "updated_at": "2026-08-02T08:01:21+08:00",
+  "latest_issue": 186,
+  "issues": [
+    {
+      "issue_no": 186,
+      "title": "手抄报|186期：高切低后，双创半月回调15%",
+      "publish_date": "2026-07-17",
+      "source_url": "https://xueqiu.com/3502863673/400720074",
+      "coefficient": 6,
+      "sentiment": "正常偏热",
+      "portfolios": [],
+      "market_view": "本周市场继续缩量调整，上证指数跌破3900点，沪深300指数已连续4周下跌。科创成长板块持续回调，双创半月回调近15%，通信、芯片等科技行业全球联动下跌。生物医药、食品饮料、金融、煤炭等前期下跌板块近期持续反弹。",
+      "empirical_actions": [
+        {
+          "name": "实证2",
+          "action": "无操作",
+          "note": "无操作"
+        }
+      ],
+      "collected_at": "2026-08-02T08:01:21+08:00"
+    }
+  ]
+}
