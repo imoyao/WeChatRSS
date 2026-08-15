@@ -300,7 +300,7 @@ def fetch_xueqiu_latest_via_api(cookie: str = "") -> dict | None:
 
 
 class ErNiaoAnalyzer(Analyzer):
-    key = "erniao"
+    key = "er-niao"          # data/er-niao/ 目录（与历史路径保持一致）
     feed_name = "二鸟说"
     source_name = "二鸟说手抄报"
 
@@ -318,10 +318,18 @@ class ErNiaoAnalyzer(Analyzer):
             "collected_at": now_iso(),
         }
 
-    def analyze_text(self, text: str, env: dict, source_url: str = "") -> dict:
-        """给定全文文本 → Ark 结构化 dict（CLI --article 用）。"""
+    def analyze_text(self, text: str, env: dict, source_url: str = "",
+                     publish_date: str = "") -> dict:
+        """给定全文文本 → Ark 结构化 dict（CLI --article 用）。
+
+        publish_date: 调用方已知真实发布日期时（如从雪球页头读到的 "发布于 2026-08-14"）
+        优先采用，覆盖模型对日期的猜测——模型在 CLI 路径下只看到正文，
+        对「最新一期」的发布日期常猜错（曾误判 188 期为 2026-08-07）。
+        """
         data = call_ark(text, SYSTEM_PROMPT, env)
         data["source_url"] = source_url
+        if publish_date:
+            data["publish_date"] = publish_date
         return data
 
     def run(self, repo_root: Path, env: dict) -> dict:

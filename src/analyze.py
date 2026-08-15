@@ -62,6 +62,8 @@ def main() -> int:
     ap.add_argument("--account", help="只运行指定分析器（默认全部）")
     ap.add_argument("--article", help="手动喂全文文本文件（需配合 --account）")
     ap.add_argument("--source-url", default="", help="手动喂文时的原文链接")
+    ap.add_argument("--publish-date", default="",
+                    help="手动喂文时的发布日期 YYYY-MM-DD，覆盖模型猜测")
     ap.add_argument("--from-json", help="直接合并已结构化的 JSON 文件（需配合 --account）")
     ap.add_argument("--dry-run", action="store_true", help="只分析不落盘")
     args = ap.parse_args()
@@ -85,7 +87,8 @@ def main() -> int:
         if args.article:
             text = Path(args.article).read_text(encoding="utf-8")
             try:
-                data = analyzer.analyze_text(text, env, args.source_url)
+                data = analyzer.analyze_text(
+                    text, env, args.source_url, args.publish_date)
             except Exception as e:
                 print(f"  ✗ {key} 解析失败: {e}", file=sys.stderr)
                 total["skipped"] += 1
