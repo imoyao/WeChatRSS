@@ -1,9 +1,27 @@
 {
   "source": "er-niao",
   "source_name": "二鸟说手抄报",
-  "updated_at": "2026-08-02T00:06:57+08:00",
-  "latest_issue": 186,
+  "updated_at": "2026-08-15T10:22:11+08:00",
+  "latest_issue": 188,
   "issues": [
+    {
+      "issue_no": 188,
+      "title": "手抄报|188期：反弹遇阻力，上涨缺量能",
+      "publish_date": "2026-08-14",
+      "source_url": "https://xueqiu.com/3502863673/405041792",
+      "coefficient": 6,
+      "sentiment": "正常",
+      "portfolios": [],
+      "market_view": "本周A股整体震荡，沪深两市成交额难有效突破2.5万亿，科技板块弱势反弹，市场暂无明确主线，医药、消费等上半年弱势行业近期表现亮眼，港股创新药指数临近年内高点，小微盘股反弹；A股主要指数估值变化不大，香港恒生指数连续两周小幅回调。",
+      "empirical_actions": [
+        {
+          "name": "实证2",
+          "action": "无操作",
+          "note": "无操作"
+        }
+      ],
+      "collected_at": "2026-08-15T10:22:11+08:00"
+    },
     {
       "issue_no": 186,
       "title": "手抄报|186期：高切低后，双创半月回调15%",
